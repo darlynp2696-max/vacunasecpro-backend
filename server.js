@@ -1,206 +1,322 @@
-// server.js
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const axios = require('axios');
-const { admin, db } = require('./firebaseAdmin');
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const axios = require("axios");
+const { admin, db } = require("./firebaseAdmin");
 
 const app = express();
-const PORT = process.env.PORT || 4000;
-
-// CORS (ajusta origins en producción)
 app.use(cors());
 app.use(express.json());
 
-// Config PayPal (LIVE)
-const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
-const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
-const PAYPAL_API_BASE = 'https://api-m.paypal.com';
+const PORT = process.env.PORT || 4000;
 
-// Helper: obtener token de PayPal
+const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
+const PAYPAL_SECRET = process.env.PAYPAL_SECRET;
+const PAYPAL_WEBHOOK_ID = process.env.PAYPAL_WEBHOOK_ID;
+const PAYPAL_BASE = "https://api-m.paypal.com"; // LIVE
+
+if (!PAYPAL_CLIENT_ID || !PAYPAL_SECRET) {
+  console.warn("⚠️ PAYPAL_CLIENT_ID o PAYPAL_SECRET no están configurados. Revisa tus variables de entorno.");
+}
+if (!PAYPAL_WEBHOOK_ID) {
+  console.warn("⚠️ PAYPAL_WEBHOOK_ID no está configurado. Los webhooks no podrán verificarse.");
+}
+
+// ---------- HELPERS PAYPAL ----------
+
 async function getPayPalAccessToken() {
-  const resp = await axios({
-    url: `${PAYPAL_API_BASE}/v1/oauth2/token`,
-    method: 'post',
-    auth: {
-      username: PAYPAL_CLIENT_ID,
-      password: PAYPAL_CLIENT_SECRET,
-    },
-    params: {
-      grant_type: 'client_credentials',
-    },
-  });
+  const basicAuth = Buffer.from(
+    `${PAYPAL_CLIENT_ID}:${PAYPAL_SECRET}`
+  ).toString("base64");
+
+  const resp = await axios.post(
+    `${PAYPAL_BASE}/v1/oauth2/token`,
+    "grant_type=client_credentials",
+    {
+      headers: {
+        Authorization: `Basic ${basicAuth}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+    }
+  );
+
   return resp.data.access_token;
 }
 
-// Helper: obtener detalles de la suscripción
-async function getPayPalSubscription(subscriptionId) {
-  const token = await getPayPalAccessToken();
+async function getSubscriptionFromPayPal(subscriptionId) {
+  const accessToken = await getPayPalAccessToken();
+
   const resp = await axios.get(
-    `${PAYPAL_API_BASE}/v1/billing/subscriptions/${subscriptionId}`,
+    `${PAYPAL_BASE}/v1/billing/subscriptions/${subscriptionId}`,
     {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
+      headers: { Authorization: `Bearer ${accessToken}` },
     }
   );
 
   return resp.data;
 }
 
-// 🔹 Guardar/actualizar suscripción en Firestore
-async function saveSubscriptionRecord({
-  userId,
+/**
+ * Guarda/actualiza la suscripción en Firestore
+ * - subscriptionsById/{subscriptionId}
+ * - userSubscriptions/{email} (si conocemos email)
+ */
+async function upsertSubscriptionInFirestore({
+  subscription,
   email,
-  subscriptionId,
-  planId,
-  status,
-  nextBillingTime,
-  raw,
+  lastWebhookEvent,
 }) {
-  const docRef = db.collection('subscriptions').doc(userId);
+  const subscriptionId = subscription.id;
+  const status = subscription.status;
+  const planId = subscription.plan_id;
+  const startTime = subscription.start_time;
+  const billingInfo = subscription.billing_info || {};
 
-  await docRef.set(
+  const nextBillingTime = billingInfo.next_billing_time || null;
+  const lastPaymentTime =
+    billingInfo.last_payment && billingInfo.last_payment.time
+      ? billingInfo.last_payment.time
+      : null;
+
+  const subRef = db.collection("subscriptionsById").doc(subscriptionId);
+  const subSnap = await subRef.get();
+  const prevData = subSnap.exists ? subSnap.data() : {};
+
+  // si no vino email, intenta usar el que ya teníamos
+  const finalEmail = email || prevData.email || null;
+
+  // 1) subscriptionsById
+  await subRef.set(
     {
-      userId,
-      email,
       subscriptionId,
-      planId,
+      email: finalEmail,
       status,
-      nextBillingTime: nextBillingTime || null,
-      raw: raw || null,
+      planId,
+      startTime: startTime || prevData.startTime || null,
+      nextBillingTime,
+      lastPaymentTime,
+      lastWebhookEvent: lastWebhookEvent || prevData.lastWebhookEvent || null,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     },
     { merge: true }
   );
+
+  // 2) userSubscriptions (solo si conocemos email)
+  if (finalEmail) {
+    const userRef = db.collection("userSubscriptions").doc(finalEmail);
+    await userRef.set(
+      {
+        email: finalEmail,
+        userId: finalEmail,
+        subscriptionId,
+        status,
+        planId,
+        startTime: startTime || null,
+        nextBillingTime,
+        lastPaymentTime,
+        lastWebhookEvent: lastWebhookEvent || null,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  }
+
+  return {
+    subscriptionId,
+    status,
+    planId,
+    nextBillingTime,
+    lastPaymentTime,
+    email: finalEmail,
+  };
 }
 
-// 🔹 Leer suscripción desde Firestore
-async function getSubscriptionRecord(userId) {
-  const doc = await db.collection('subscriptions').doc(userId).get();
-  if (!doc.exists) return null;
-  return doc.data();
+/**
+ * Verifica la firma del webhook con la API de PayPal
+ */
+async function verifyWebhookSignature(req) {
+  if (!PAYPAL_WEBHOOK_ID) {
+    throw new Error("PAYPAL_WEBHOOK_ID no configurado");
+  }
+
+  const transmissionId = req.get("paypal-transmission-id");
+  const transmissionTime = req.get("paypal-transmission-time");
+  const certUrl = req.get("paypal-cert-url");
+  const authAlgo = req.get("paypal-auth-algo");
+  const transmissionSig = req.get("paypal-transmission-sig");
+  const webhookEvent = req.body;
+
+  const accessToken = await getPayPalAccessToken();
+
+  const resp = await axios.post(
+    `${PAYPAL_BASE}/v1/notifications/verify-webhook-signature`,
+    {
+      auth_algo: authAlgo,
+      cert_url: certUrl,
+      transmission_id: transmissionId,
+      transmission_sig: transmissionSig,
+      transmission_time: transmissionTime,
+      webhook_id: PAYPAL_WEBHOOK_ID,
+      webhook_event: webhookEvent,
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+    }
+  );
+
+  return resp.data.verification_status === "SUCCESS";
 }
 
-// ✅ Endpoint: validar suscripción después del pago
-app.post('/api/paypal/validate-subscription', async (req, res) => {
+// ---------- ENDPOINTS ----------
+
+/**
+ * POST /api/paypal/validate-subscription
+ * Se llama desde tu index.html después de crear la suscripción en PayPal.
+ * Body: { subscriptionId, userId, email }
+ */
+app.post("/api/paypal/validate-subscription", async (req, res) => {
   try {
     const { subscriptionId, userId, email } = req.body;
 
-    if (!subscriptionId || !userId || !email) {
-      return res.status(400).json({
-        ok: false,
-        error: 'subscriptionId, userId y email son obligatorios',
-      });
+    if (!subscriptionId) {
+      return res
+        .status(400)
+        .json({ ok: false, message: "subscriptionId es requerido" });
     }
 
-    console.log('Validando suscripción:', subscriptionId, 'para', userId);
+    const subscription = await getSubscriptionFromPayPal(subscriptionId);
 
-    const paypalSub = await getPayPalSubscription(subscriptionId);
-
-    const status = paypalSub.status; // ACTIVE, SUSPENDED, CANCELLED, etc.
-    const planId = paypalSub.plan_id;
-    const nextBillingTime =
-      paypalSub.billing_info?.next_billing_time || null;
-
-    // Lógica de si consideramos activa para la app
-    const activeStatuses = ['ACTIVE', 'TRIALING'];
-    const activeForApp = activeStatuses.includes(status);
-
-    // Guardamos en Firestore
-    await saveSubscriptionRecord({
-      userId,
-      email,
-      subscriptionId,
-      planId,
-      status,
-      nextBillingTime,
-      raw: {
-        status,
-        planId,
-        nextBillingTime,
-      },
+    // Guarda/actualiza en Firestore
+    const upsertInfo = await upsertSubscriptionInFirestore({
+      subscription,
+      email: email || userId || null,
+      lastWebhookEvent: "VALIDATE_SUBSCRIPTION",
     });
+
+    const activeForApp = subscription.status === "ACTIVE";
 
     return res.json({
       ok: true,
-      userId,
-      email,
-      subscriptionId,
-      subscriptionStatus: status,
+      userId: email || userId || null,
       activeForApp,
-      planId,
-      nextBillingTime,
+      subscriptionStatus: subscription.status,
+      subscriptionId: subscription.id,
+      planId: subscription.plan_id,
+      nextBillingTime: upsertInfo.nextBillingTime,
+      lastPaymentTime: upsertInfo.lastPaymentTime,
     });
   } catch (err) {
-    console.error('Error validando suscripción PayPal:', err?.response?.data || err);
-
+    console.error(
+      "Error en /api/paypal/validate-subscription:",
+      err.response?.data || err.message
+    );
     return res.status(500).json({
       ok: false,
-      error: 'Error al validar la suscripción en PayPal',
-      details: err?.response?.data || err.message,
+      message: "Error validando suscripción",
+      error: err.response?.data || err.message,
     });
   }
 });
 
-// ✅ Endpoint: consultar estado por userId (correo)
-app.get('/api/subscription/status/:userId', async (req, res) => {
+/**
+ * GET /api/subscription/status/:userId
+ * La app Android pregunta con el correo.
+ */
+app.get("/api/subscription/status/:userId", async (req, res) => {
   try {
-    const { userId } = req.params;
-    if (!userId) {
-      return res.status(400).json({
-        ok: false,
-        error: 'userId requerido',
-      });
-    }
+    const userId = decodeURIComponent(req.params.userId).toLowerCase();
+    const doc = await db.collection("userSubscriptions").doc(userId).get();
 
-    const record = await getSubscriptionRecord(userId);
-
-    if (!record) {
+    if (!doc.exists) {
       return res.json({
         ok: true,
         userId,
         activeForApp: false,
-        subscriptionStatus: 'NONE',
+        subscriptionStatus: "NONE",
       });
     }
 
-    const activeStatuses = ['ACTIVE', 'TRIALING'];
-    const activeForApp = activeStatuses.includes(record.status);
+    const data = doc.data();
+    const isActive = data.status === "ACTIVE";
 
     return res.json({
       ok: true,
-      userId: record.userId,
-      activeForApp,
-      subscriptionStatus: record.status,
-      subscriptionId: record.subscriptionId,
-      planId: record.planId,
-      nextBillingTime: record.nextBillingTime,
+      userId,
+      activeForApp: isActive,
+      subscriptionStatus: data.status,
+      subscriptionId: data.subscriptionId || null,
+      planId: data.planId || null,
+      nextBillingTime: data.nextBillingTime || null,
+      lastPaymentTime: data.lastPaymentTime || null,
     });
   } catch (err) {
-    console.error('Error consultando suscripción:', err);
+    console.error(
+      "Error en /api/subscription/status:",
+      err.response?.data || err.message
+    );
     return res.status(500).json({
       ok: false,
-      error: 'Error consultando suscripción',
-      details: err.message,
+      message: "Error consultando estado de suscripción",
     });
   }
 });
 
-// (Opcional) Endpoint debug: listar todas las suscripciones (solo desarrollo)
-app.get('/api/subscription/debug/all', async (req, res) => {
+/**
+ * POST /api/paypal/webhook
+ * PayPal envía aquí eventos cuando cambia algo en la suscripción.
+ */
+app.post("/api/paypal/webhook", async (req, res) => {
   try {
-    const snap = await db.collection('subscriptions').get();
-    const items = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-    res.json({ ok: true, items });
+    // 1) Verificar firma
+    const isValid = await verifyWebhookSignature(req);
+    if (!isValid) {
+      console.error("Firma de webhook PayPal NO válida");
+      return res.status(400).send("INVALID_SIGNATURE");
+    }
+
+    const event = req.body;
+    console.log("Webhook PayPal recibido:", event.event_type);
+
+    const eventType = event.event_type;
+    const resource = event.resource || {};
+    const subscriptionId = resource.id;
+
+    if (!subscriptionId) {
+      console.warn("Webhook sin subscriptionId en resource.id");
+      return res.status(200).send("NO_SUBSCRIPTION_ID");
+    }
+
+    // 2) Traer estado actual de la suscripción desde PayPal
+    const subscription = await getSubscriptionFromPayPal(subscriptionId);
+
+    // 3) Actualizar Firestore
+    await upsertSubscriptionInFirestore({
+      subscription,
+      email: null, // intentará usar el email ya guardado
+      lastWebhookEvent: eventType,
+    });
+
+    console.log(
+      `Webhook procesado para suscripción ${subscriptionId} con estado ${subscription.status}`
+    );
+
+    return res.status(200).send("OK");
   } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
+    console.error(
+      "Error procesando webhook PayPal:",
+      err.response?.data || err.message
+    );
+    return res.status(500).send("ERROR");
   }
 });
 
-app.get('/', (req, res) => {
-  res.send('VacunasECPro backend OK');
+// ---------- ARRANQUE ----------
+
+app.get("/", (req, res) => {
+  res.send("VacunasECPro backend funcionando ✅");
 });
 
 app.listen(PORT, () => {
