@@ -15,11 +15,18 @@ const PAYPAL_SECRET = process.env.PAYPAL_SECRET;
 const PAYPAL_WEBHOOK_ID = process.env.PAYPAL_WEBHOOK_ID;
 const PAYPAL_BASE = "https://api-m.paypal.com"; // LIVE
 
+// Estados que consideramos "activos" para la app
+const ACTIVE_STATUSES = ["ACTIVE", "APPROVAL_PENDING", "APPROVED"];
+
 if (!PAYPAL_CLIENT_ID || !PAYPAL_SECRET) {
-  console.warn("⚠️ PAYPAL_CLIENT_ID o PAYPAL_SECRET no están configurados. Revisa tus variables de entorno.");
+  console.warn(
+    "⚠️ PAYPAL_CLIENT_ID o PAYPAL_SECRET no están configurados. Revisa tus variables de entorno."
+  );
 }
 if (!PAYPAL_WEBHOOK_ID) {
-  console.warn("⚠️ PAYPAL_WEBHOOK_ID no está configurado. Los webhooks no podrán verificarse.");
+  console.warn(
+    "⚠️ PAYPAL_WEBHOOK_ID no está configurado. Los webhooks no podrán verificarse."
+  );
 }
 
 // ---------- HELPERS PAYPAL ----------
@@ -103,11 +110,11 @@ async function upsertSubscriptionInFirestore({
 
   // 2) userSubscriptions (solo si conocemos email)
   if (finalEmail) {
-    const userRef = db.collection("userSubscriptions").doc(finalEmail);
+    const userRef = db.collection("userSubscriptions").doc(finalEmail.toLowerCase());
     await userRef.set(
       {
-        email: finalEmail,
-        userId: finalEmail,
+        email: finalEmail.toLowerCase(),
+        userId: finalEmail.toLowerCase(),
         subscriptionId,
         status,
         planId,
@@ -196,11 +203,12 @@ app.post("/api/paypal/validate-subscription", async (req, res) => {
       lastWebhookEvent: "VALIDATE_SUBSCRIPTION",
     });
 
-    const activeForApp = subscription.status === "ACTIVE";
+    // Activa para la app si está en alguno de los estados permitidos
+    const activeForApp = ACTIVE_STATUSES.includes(subscription.status);
 
     return res.json({
       ok: true,
-      userId: email || userId || null,
+      userId: (email || userId || "").toLowerCase() || null,
       activeForApp,
       subscriptionStatus: subscription.status,
       subscriptionId: subscription.id,
@@ -223,7 +231,8 @@ app.post("/api/paypal/validate-subscription", async (req, res) => {
 
 /**
  * GET /api/subscription/status/:userId
- * La app Android pregunta con el correo.
+ * Endpoint tipo REST con parámetro en la URL.
+ * Lo puedes usar desde scripts, pruebas, etc.
  */
 app.get("/api/subscription/status/:userId", async (req, res) => {
   try {
@@ -240,7 +249,7 @@ app.get("/api/subscription/status/:userId", async (req, res) => {
     }
 
     const data = doc.data();
-    const isActive = data.status === "ACTIVE";
+    const isActive = ACTIVE_STATUSES.includes(data.status);
 
     return res.json({
       ok: true,
@@ -255,6 +264,58 @@ app.get("/api/subscription/status/:userId", async (req, res) => {
   } catch (err) {
     console.error(
       "Error en /api/subscription/status:",
+      err.response?.data || err.message
+    );
+    return res.status(500).json({
+      ok: false,
+      message: "Error consultando estado de suscripción",
+    });
+  }
+});
+
+/**
+ * GET /api/app/user-status?userId=correo
+ * Este es el endpoint que usa la APP ANDROID (SubscriptionApi).
+ * Mismo comportamiento que /api/subscription/status/:userId pero con query param.
+ */
+app.get("/api/app/user-status", async (req, res) => {
+  try {
+    const rawUserId = (req.query.userId || "").toString().trim();
+    if (!rawUserId) {
+      return res.status(400).json({
+        ok: false,
+        message: "Falta el parámetro userId (correo).",
+      });
+    }
+
+    const userId = rawUserId.toLowerCase();
+    const doc = await db.collection("userSubscriptions").doc(userId).get();
+
+    if (!doc.exists) {
+      return res.json({
+        ok: true,
+        userId,
+        activeForApp: false,
+        subscriptionStatus: "NONE",
+      });
+    }
+
+    const data = doc.data();
+    const isActive = ACTIVE_STATUSES.includes(data.status);
+
+    return res.json({
+      ok: true,
+      userId,
+      activeForApp: isActive,
+      subscriptionStatus: data.status,
+      subscriptionId: data.subscriptionId || null,
+      planId: data.planId || null,
+      nextBillingTime: data.nextBillingTime || null,
+      lastPaymentTime: data.lastPaymentTime || null,
+    });
+  } catch (err) {
+    console.error(
+      "Error en /api/app/user-status:",
       err.response?.data || err.message
     );
     return res.status(500).json({
